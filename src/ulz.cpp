@@ -6,7 +6,6 @@ Written and placed in the public domain by Ilya Muravyov
 
 */
 
-#define _CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES 1
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_DISABLE_PERFCRIT_LOCKS
 
@@ -16,8 +15,7 @@ Written and placed in the public domain by Ilya Muravyov
 #include <time.h>
 
 #ifndef _MSC_VER
-#  define _FILE_OFFSET_BITS 64
-#  define _ftelli64 ftello
+#  define _ftelli64 ftello64
 #endif
 
 #include "ulz.hpp"
@@ -26,15 +24,36 @@ Written and placed in the public domain by Ilya Muravyov
 
 #define BLOCK_SIZE (1<<24)
 
+void compress_fast(FILE* in, FILE* out)
+{
+  ULZ* ulz=new ULZ;
+
+  ULZ::U8* in_buf=new ULZ::U8[BLOCK_SIZE+ULZ::EXCESS];
+  ULZ::U8* out_buf=new ULZ::U8[BLOCK_SIZE+ULZ::EXCESS];
+
+  int raw_len;
+  while ((raw_len=fread(in_buf, 1, BLOCK_SIZE, in))>0)
+  {
+    const int comp_len=ulz->CompressFast(in_buf, raw_len, out_buf);
+
+    fwrite(&comp_len, 1, sizeof(comp_len), out);
+    fwrite(out_buf, 1, comp_len, out);
+
+    fprintf(stderr, "%lld -> %lld\r", _ftelli64(in), _ftelli64(out));
+  }
+
+  delete ulz;
+
+  delete[] in_buf;
+  delete[] out_buf;
+}
+
 void compress(FILE* in, FILE* out, int level)
 {
-  const int magic=ULZ_MAGIC;
-  fwrite(&magic, 1, sizeof(magic), out);
+  ULZ* ulz=new ULZ;
 
-  CULZ* ulz=new CULZ;
-
-  CULZ::U8* in_buf=new CULZ::U8[BLOCK_SIZE+CULZ::EXCESS];
-  CULZ::U8* out_buf=new CULZ::U8[BLOCK_SIZE+CULZ::EXCESS];
+  ULZ::U8* in_buf=new ULZ::U8[BLOCK_SIZE+ULZ::EXCESS];
+  ULZ::U8* out_buf=new ULZ::U8[BLOCK_SIZE+ULZ::EXCESS];
 
   int raw_len;
   while ((raw_len=fread(in_buf, 1, BLOCK_SIZE, in))>0)
@@ -52,37 +71,24 @@ void compress(FILE* in, FILE* out, int level)
   delete[] in_buf;
   delete[] out_buf;
 }
-void decompress(FILE* in, FILE* out)
+
+int decompress(FILE* in, FILE* out)
 {
-  int magic;
-  fread(&magic, 1, sizeof(magic), in);
-  if (magic!=ULZ_MAGIC)
-  {
-    fprintf(stderr, "Not in ULZ format!\n");
-    exit(1);
-  }
+  ULZ* ulz=new ULZ;
 
-  CULZ* ulz=new CULZ;
-
-  CULZ::U8* in_buf=new CULZ::U8[BLOCK_SIZE+CULZ::EXCESS];
-  CULZ::U8* out_buf=new CULZ::U8[BLOCK_SIZE+CULZ::EXCESS];
+  ULZ::U8* in_buf=new ULZ::U8[BLOCK_SIZE+ULZ::EXCESS];
+  ULZ::U8* out_buf=new ULZ::U8[BLOCK_SIZE+ULZ::EXCESS];
 
   int comp_len;
   while (fread(&comp_len, 1, sizeof(comp_len), in)>0)
   {
-    if (comp_len<2 || comp_len>(BLOCK_SIZE+CULZ::EXCESS)
+    if (comp_len<2 || comp_len>(BLOCK_SIZE+ULZ::EXCESS)
         || fread(in_buf, 1, comp_len, in)!=comp_len)
-    {
-      fprintf(stderr, "Corrupt input!\n");
-      exit(1);
-    }
+      return -1;
 
     const int out_len=ulz->Decompress(in_buf, comp_len, out_buf, BLOCK_SIZE);
     if (out_len<0)
-    {
-      fprintf(stderr, "Stream error!\n");
-      exit(1);
-    }
+      return -1;
 
     if (fwrite(out_buf, 1, out_len, out)!=out_len)
     {
@@ -97,6 +103,8 @@ void decompress(FILE* in, FILE* out)
 
   delete[] in_buf;
   delete[] out_buf;
+
+  return 0;
 }
 
 int main(int argc, char** argv)
@@ -106,7 +114,7 @@ int main(int argc, char** argv)
   if (argc<3)
   {
     fprintf(stderr,
-        "ULZ - An ultra-fast LZ77 compressor, v1.00 BETA\n"
+        "ULZ - An ultra-fast LZ77 compressor, v1.01 BETA\n"
         "Written and placed in the public domain by Ilya Muravyov\n"
         "\n"
         "Usage: ULZ command infile [outfile]\n"
@@ -131,7 +139,7 @@ int main(int argc, char** argv)
     if (*argv[1]=='d')
     {
       const int p=strlen(out_name)-4;
-      if (p>0 && !strcmp(&out_name[p], ".ulz"))
+      if (p>0 && strcmp(&out_name[p], ".ulz")==0)
         out_name[p]='\0';
       else
         strcat(out_name, ".out");
@@ -151,8 +159,8 @@ int main(int argc, char** argv)
 
   if (*argv[1]=='c')
   {
-    int level=4;
-    if (argv[1][1])
+    int level=1;
+    if (argv[1][1]!='\0')
       level=atoi(&argv[1][1]);
     if (level<1 || level>9)
     {
@@ -160,15 +168,33 @@ int main(int argc, char** argv)
       exit(1);
     }
 
-    fprintf(stderr, "Compressing %s:\n", argv[2]);
+    printf("Compressing %s:\n", argv[2]);
 
-    compress(in, out, level);
+    const int magic=ULZ_MAGIC;
+    fwrite(&magic, 1, sizeof(magic), out);
+
+    if (level==1)
+      compress_fast(in, out);
+    else
+      compress(in, out, level);
   }
   else if (*argv[1]=='d')
   {
-    fprintf(stderr, "Decompressing %s:\n", argv[2]);
+    int magic;
+    fread(&magic, 1, sizeof(magic), in);
+    if (magic!=ULZ_MAGIC)
+    {
+      fprintf(stderr, "%s: Not in ULZ format\n", argv[2]);
+      exit(1);
+    }
 
-    decompress(in, out);
+    printf("Decompressing %s:\n", argv[2]);
+
+    if (decompress(in, out)!=0)
+    {
+      fprintf(stderr, "%s: Corrupt input\n", argv[2]);
+      exit(1);
+    }
   }
   else
   {
@@ -176,7 +202,7 @@ int main(int argc, char** argv)
     exit(1);
   }
 
-  fprintf(stderr, "%lld -> %lld in %0.3f sec\n", _ftelli64(in), _ftelli64(out),
+  printf("%lld -> %lld in %1.3f sec\n", _ftelli64(in), _ftelli64(out),
       double(clock()-start)/CLOCKS_PER_SEC);
 
   fclose(in);

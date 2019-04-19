@@ -6,32 +6,31 @@ Written and placed in the public domain by Ilya Muravyov
 
 */
 
-#ifndef __ULZ_HPP
-#define __ULZ_HPP
+#ifndef ULZ_HPP_INCLUDED
+#define ULZ_HPP_INCLUDED
 
-class CULZ
+class ULZ
 {
 public:
   typedef unsigned char U8;
   typedef unsigned short U16;
   typedef unsigned int U32;
+  typedef unsigned long long U64;
 
   static const int EXCESS=16;
 
-  static const int WINDOW_BITS=17;
+  static const int WINDOW_BITS=17; // Hard-coded
   static const int WINDOW_SIZE=1<<WINDOW_BITS;
   static const int WINDOW_MASK=WINDOW_SIZE-1;
 
   static const int MIN_MATCH=4;
 
-  static const int HASH_BITS=18;
+  static const int HASH_BITS=19;
   static const int HASH_SIZE=1<<HASH_BITS;
   static const int NIL=-1;
 
-  // Hash chain
-
-  int Head[HASH_SIZE];
-  int Tail[WINDOW_SIZE];
+  int HashTable[HASH_SIZE];
+  int Prev[WINDOW_SIZE];
 
   // Utils
 
@@ -62,21 +61,17 @@ public:
     *reinterpret_cast<U16*>(p)=x;
   }
 
-  inline void UnalignedCopy32(void* d, void* s)
+  inline void UnalignedCopy64(void* d, void* s)
   {
-    *reinterpret_cast<U32*>(d)=UnalignedLoad32(s);
+    *reinterpret_cast<U64*>(d)=*reinterpret_cast<const U64*>(s);
   }
 
   inline void WildCopy(U8* d, U8* s, int n)
   {
-    UnalignedCopy32(d, s);
-    UnalignedCopy32(d+4, s+4);
+    UnalignedCopy64(d, s);
 
     for (int i=8; i<n; i+=8)
-    {
-      UnalignedCopy32(d+i, s+i);
-      UnalignedCopy32(d+i+4, s+i+4);
-    }
+      UnalignedCopy64(d+i, s+i);
   }
 
   inline U32 Hash32(void* p)
@@ -98,9 +93,9 @@ public:
   inline U32 DecodeMod(U8*& p)
   {
     U32 x=0;
-    for (int i=0; i<=28; i+=7)
+    for (int i=0; i<=21; i+=7)
     {
-      const int c=*p++;
+      const U32 c=*p++;
       x+=c<<i;
       if (c<128)
         break;
@@ -110,29 +105,125 @@ public:
 
   // LZ77
 
-  int Compress(U8* in, int in_len, U8* out, int level=4)
+  int CompressFast(U8* in, int in_len, U8* out)
   {
-    const int max_chain=(level<8)?1<<level:WINDOW_SIZE;
-    U8* op=out;
-
     for (int i=0; i<HASH_SIZE; ++i)
-      Head[i]=NIL;
+      HashTable[i]=NIL;
 
-    int run=0;
+    U8* op=out;
+    int anchor=0;
 
     int p=0;
     while (p<in_len)
     {
-      int best_len=MIN_MATCH-1;
+      int best_len=0;
       int dist=0;
 
       const int max_match=in_len-p;
       if (max_match>=MIN_MATCH)
       {
-        int limit=Max(p-WINDOW_SIZE, NIL);
+        const int limit=Max(p-WINDOW_SIZE, NIL);
+
+        const U32 h=Hash32(&in[p]);
+        int s=HashTable[h];
+        HashTable[h]=p;
+
+        if (s>limit && UnalignedLoad32(&in[s])==UnalignedLoad32(&in[p]))
+        {
+          int len=MIN_MATCH;
+          while (len<max_match && in[s+len]==in[p+len])
+            ++len;
+
+          best_len=len;
+          dist=p-s;
+        }
+      }
+
+      if (best_len==MIN_MATCH && (p-anchor)>=(7+128))
+        best_len=0;
+
+      if (best_len>=MIN_MATCH)
+      {
+        const int len=best_len-MIN_MATCH;
+        const int token=((dist>>12)&16)+Min(len, 15);
+
+        if (anchor!=p)
+        {
+          const int run=p-anchor;
+          if (run>=7)
+          {
+            *op++=(7<<5)+token;
+            EncodeMod(op, run-7);
+          }
+          else
+            *op++=(run<<5)+token;
+
+          WildCopy(op, &in[anchor], run);
+          op+=run;
+        }
+        else
+          *op++=token;
+
+        if (len>=15)
+          EncodeMod(op, len-15);
+
+        UnalignedStore16(op, dist);
+        op+=2;
+
+        anchor=p+best_len;
+        ++p;
+        HashTable[Hash32(&in[p])]=p++;
+        HashTable[Hash32(&in[p])]=p++;
+        HashTable[Hash32(&in[p])]=p++;
+        p=anchor;
+      }
+      else
+        ++p;
+    }
+
+    if (anchor!=p)
+    {
+      const int run=p-anchor;
+      if (run>=7)
+      {
+        *op++=7<<5;
+        EncodeMod(op, run-7);
+      }
+      else
+        *op++=run<<5;
+
+      WildCopy(op, &in[anchor], run);
+      op+=run;
+    }
+
+    return op-out;
+  }
+
+  int Compress(U8* in, int in_len, U8* out, int level)
+  {
+    if (level<1 || level>9)
+      return -1;
+    const int max_chain=(level<9)?1<<level:1<<13;
+
+    for (int i=0; i<HASH_SIZE; ++i)
+      HashTable[i]=NIL;
+
+    U8* op=out;
+    int anchor=0;
+
+    int p=0;
+    while (p<in_len)
+    {
+      int best_len=0;
+      int dist=0;
+
+      const int max_match=in_len-p;
+      if (max_match>=MIN_MATCH)
+      {
+        const int limit=Max(p-WINDOW_SIZE, NIL);
         int chain_len=max_chain;
 
-        int s=Head[Hash32(&in[p])];
+        int s=HashTable[Hash32(&in[p])];
         while (s>limit)
         {
           if (in[s+best_len]==in[p+best_len]
@@ -152,75 +243,70 @@ public:
             }
           }
 
-          if (!--chain_len)
+          if (--chain_len==0)
             break;
 
-          s=Tail[s&WINDOW_MASK];
+          s=Prev[s&WINDOW_MASK];
         }
+      }
 
-        if (best_len==MIN_MATCH && run>=(7+128))
-          best_len=0;
+      if (best_len==MIN_MATCH && (p-anchor)>=(7+128))
+        best_len=0;
 
-        if (level==9 && best_len>=MIN_MATCH && best_len<max_match)
+      if (level>=5 && best_len>=MIN_MATCH && best_len<max_match
+          && (p-anchor)!=6)
+      {
+        const int x=p+1;
+        const int target_len=best_len+1;
+
+        const int limit=Max(x-WINDOW_SIZE, NIL);
+        int chain_len=max_chain;
+
+        int s=HashTable[Hash32(&in[x])];
+        while (s>limit)
         {
-
-          for (int i=1; i<=2 && best_len; ++i) // 2-byte lookahead
+          if (in[s+best_len]==in[x+best_len]
+              && UnalignedLoad32(&in[s])==UnalignedLoad32(&in[x]))
           {
-            const int target_len=best_len+i;
-            const int j=p+i;
+            int len=MIN_MATCH;
+            while (len<target_len && in[s+len]==in[x+len])
+              ++len;
 
-            limit=Max(j-WINDOW_SIZE, NIL);
-            chain_len=max_chain;
-
-            s=Head[Hash32(&in[j])];
-            while (s>limit)
+            if (len==target_len)
             {
-              if (in[s+best_len]==in[j+best_len]
-                  && UnalignedLoad32(&in[s])==UnalignedLoad32(&in[j]))
-              {
-                int len=MIN_MATCH;
-                while (len<target_len && in[s+len]==in[j+len])
-                  ++len;
-
-                if (len==target_len)
-                {
-                  best_len=0;
-                  break;
-                }
-              }
-
-              if (!--chain_len)
-                break;
-
-              s=Tail[s&WINDOW_MASK];
+              best_len=0;
+              break;
             }
           }
-        }
 
+          if (--chain_len==0)
+            break;
+
+          s=Prev[s&WINDOW_MASK];
+        }
       }
 
       if (best_len>=MIN_MATCH)
       {
         const int len=best_len-MIN_MATCH;
-        const int tmp=((dist>>12)&16)+Min(len, 15);
+        const int token=((dist>>12)&16)+Min(len, 15);
 
-        if (run)
+        if (anchor!=p)
         {
+          const int run=p-anchor;
           if (run>=7)
           {
-            *op++=(7<<5)+tmp;
+            *op++=(7<<5)+token;
             EncodeMod(op, run-7);
           }
           else
-            *op++=(run<<5)+tmp;
+            *op++=(run<<5)+token;
 
-          WildCopy(op, &in[p-run], run);
+          WildCopy(op, &in[anchor], run);
           op+=run;
-
-          run=0;
         }
         else
-          *op++=tmp;
+          *op++=token;
 
         if (len>=15)
           EncodeMod(op, len-15);
@@ -228,25 +314,25 @@ public:
         UnalignedStore16(op, dist);
         op+=2;
 
-        while (best_len--)
+        while (best_len--!=0)
         {
           const U32 h=Hash32(&in[p]);
-          Tail[p&WINDOW_MASK]=Head[h];
-          Head[h]=p++;
+          Prev[p&WINDOW_MASK]=HashTable[h];
+          HashTable[h]=p++;
         }
+        anchor=p;
       }
       else
       {
-        ++run;
-
         const U32 h=Hash32(&in[p]);
-        Tail[p&WINDOW_MASK]=Head[h];
-        Head[h]=p++;
+        Prev[p&WINDOW_MASK]=HashTable[h];
+        HashTable[h]=p++;
       }
     }
 
-    if (run)
+    if (anchor!=p)
     {
+      const int run=p-anchor;
       if (run>=7)
       {
         *op++=7<<5;
@@ -255,10 +341,8 @@ public:
       else
         *op++=run<<5;
 
-      WildCopy(op, &in[p-run], run);
+      WildCopy(op, &in[anchor], run);
       op+=run;
-
-      //run=0;
     }
 
     return op-out;
@@ -273,13 +357,14 @@ public:
 
     while (ip<ip_end)
     {
-      const int tag=*ip++;
-      if (tag>=32)
+      const int token=*ip++;
+
+      if (token>=32)
       {
-        int run=tag>>5;
+        int run=token>>5;
         if (run==7)
           run+=DecodeMod(ip);
-        if ((op+run)>op_end) // Overrun check
+        if ((op_end-op)<run || (ip_end-ip)<run) // Overrun check
           return -1;
 
         WildCopy(op, ip, run);
@@ -289,26 +374,30 @@ public:
           break;
       }
 
-      int len=(tag&15)+MIN_MATCH;
+      int len=(token&15)+MIN_MATCH;
       if (len==(15+MIN_MATCH))
         len+=DecodeMod(ip);
-      if ((op+len)>op_end) // Overrun check
+      if ((op_end-op)<len) // Overrun check
         return -1;
 
-      const int dist=((tag&16)<<12)+UnalignedLoad16(ip);
+      const int dist=((token&16)<<12)+UnalignedLoad16(ip);
       ip+=2;
       U8* cp=op-dist;
-      if (cp<out) // Range check
+      if ((op-out)<dist) // Range check
         return -1;
 
-      if (dist>=4)
+      if (dist>=8)
       {
         WildCopy(op, cp, len);
         op+=len;
       }
       else
       {
-        while (len--)
+        *op++=*cp++;
+        *op++=*cp++;
+        *op++=*cp++;
+        *op++=*cp++;
+        while (len--!=4)
           *op++=*cp++;
       }
     }
@@ -317,4 +406,4 @@ public:
   }
 };
 
-#endif // __ULZ_HPP
+#endif // ULZ_HPP_INCLUDED
